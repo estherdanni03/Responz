@@ -30,11 +30,19 @@
 
 (define-constant BASE_FEE u1000000)
 
+(define-constant MIN_RESPONSE_TIME u1)
+(define-constant MAX_RESPONSE_TIME u1000)
+(define-constant PERFORMANCE_THRESHOLD u800000)
+(define-constant MAX_WORKLOAD_POINTS u100)
+(define-constant EFFICIENCY_MULTIPLIER u10000)
+
 ;; data vars
 (define-data-var emergency-counter uint u0)
 (define-data-var ambulance-counter uint u0)
 (define-data-var total-emergencies uint u0)
 (define-data-var total-completed uint u0)
+(define-data-var total-response-time uint u0)
+(define-data-var performance-reports-counter uint u0)
 
 ;; data maps
 (define-map emergencies
@@ -67,6 +75,51 @@
 
 (define-map authorized-dispatchers principal bool)
 (define-map emergency-history { emergency-id: uint, timestamp: uint } { status: uint, ambulance-id: (optional uint) })
+
+(define-map ambulance-performance
+  { ambulance-id: uint }
+  {
+    avg-response-time: uint,
+    efficiency-score: uint,
+    workload-points: uint,
+    total-distance: uint,
+    success-rate: uint,
+    last-updated: uint
+  }
+)
+
+(define-map performance-reports
+  { report-id: uint }
+  {
+    ambulance-id: uint,
+    emergency-id: uint,
+    response-time: uint,
+    distance-traveled: uint,
+    outcome-success: bool,
+    report-timestamp: uint,
+    reporter: principal
+  }
+)
+
+(define-map ambulance-workload
+  { ambulance-id: uint, date: uint }
+  {
+    calls-handled: uint,
+    total-time-busy: uint,
+    avg-response-time: uint
+  }
+)
+
+(define-map resource-allocation-log
+  { allocation-id: uint }
+  {
+    emergency-id: uint,
+    recommended-ambulances: (list 5 uint),
+    selected-ambulance: uint,
+    allocation-score: uint,
+    timestamp: uint
+  }
+)
 
 ;; public functions
 (define-public (register-emergency (location-lat int) (location-lng int) (severity uint))
@@ -251,6 +304,112 @@
   )
 )
 
+(define-public (submit-performance-report (ambulance-id uint) (emergency-id uint) (response-time uint) (distance-traveled uint) (outcome-success bool))
+  (let
+    (
+      (report-id (+ (var-get performance-reports-counter) u1))
+      (current-block stacks-block-height)
+      (ambulance (unwrap! (map-get? ambulances { ambulance-id: ambulance-id }) ERR_AMBULANCE_NOT_FOUND))
+    )
+    (asserts! (or 
+      (is-eq tx-sender (get operator ambulance))
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (asserts! (and (>= response-time MIN_RESPONSE_TIME) (<= response-time MAX_RESPONSE_TIME)) ERR_INVALID_STATUS)
+    
+    (map-set performance-reports
+      { report-id: report-id }
+      {
+        ambulance-id: ambulance-id,
+        emergency-id: emergency-id,
+        response-time: response-time,
+        distance-traveled: distance-traveled,
+        outcome-success: outcome-success,
+        report-timestamp: current-block,
+        reporter: tx-sender
+      }
+    )
+    
+    (var-set performance-reports-counter report-id)
+    (var-set total-response-time (+ (var-get total-response-time) response-time))
+    
+    (ok report-id)
+  )
+)
+
+(define-public (calculate-optimal-dispatch (emergency-id uint))
+  (let
+    (
+      (emergency (unwrap! (map-get? emergencies { emergency-id: emergency-id }) ERR_EMERGENCY_NOT_FOUND))
+      (current-block stacks-block-height)
+      (ambulance-count (var-get ambulance-counter))
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (let
+      (
+        (recommended-list (list u1 u2 u3))
+        (allocation-id (+ (var-get total-emergencies) u1))
+      )
+      (map-set resource-allocation-log
+        { allocation-id: allocation-id }
+        {
+          emergency-id: emergency-id,
+          recommended-ambulances: recommended-list,
+          selected-ambulance: u0,
+          allocation-score: (calculate-allocation-score (unwrap-panic (element-at? recommended-list u0))),
+          timestamp: current-block
+        }
+      )
+      
+      (ok recommended-list)
+    )
+  )
+)
+
+(define-public (update-workload-metrics (ambulance-id uint) (calls-handled uint) (total-time-busy uint) (avg-response-time uint))
+  (let
+    (
+      (ambulance (unwrap! (map-get? ambulances { ambulance-id: ambulance-id }) ERR_AMBULANCE_NOT_FOUND))
+      (current-date (/ stacks-block-height u144))
+    )
+    (asserts! (is-eq tx-sender (get operator ambulance)) ERR_UNAUTHORIZED)
+    
+    (map-set ambulance-workload
+      { ambulance-id: ambulance-id, date: current-date }
+      {
+        calls-handled: calls-handled,
+        total-time-busy: total-time-busy,
+        avg-response-time: avg-response-time
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (get-performance-recommendations (ambulance-id uint))
+  (let
+    (
+      (performance (default-to 
+        { avg-response-time: u0, efficiency-score: u0, workload-points: u0, total-distance: u0, success-rate: u0, last-updated: u0 }
+        (map-get? ambulance-performance { ambulance-id: ambulance-id })
+      ))
+    )
+    (ok {
+      current-efficiency: (get efficiency-score performance),
+      recommended-actions: (get-improvement-actions (get efficiency-score performance) (get workload-points performance)),
+      performance-rank: u1,
+      workload-status: (if (> (get workload-points performance) MAX_WORKLOAD_POINTS) "overloaded" "normal")
+    })
+  )
+)
+
 ;; read only functions
 (define-read-only (get-emergency (emergency-id uint))
   (map-get? emergencies { emergency-id: emergency-id })
@@ -285,6 +444,44 @@
   (map-get? emergency-history { emergency-id: emergency-id, timestamp: timestamp })
 )
 
+(define-read-only (get-ambulance-performance (ambulance-id uint))
+  (map-get? ambulance-performance { ambulance-id: ambulance-id })
+)
+
+(define-read-only (get-performance-report (report-id uint))
+  (map-get? performance-reports { report-id: report-id })
+)
+
+(define-read-only (get-workload-metrics (ambulance-id uint) (date uint))
+  (map-get? ambulance-workload { ambulance-id: ambulance-id, date: date })
+)
+
+(define-read-only (get-allocation-log (allocation-id uint))
+  (map-get? resource-allocation-log { allocation-id: allocation-id })
+)
+
+(define-read-only (get-system-performance-stats)
+  (let
+    (
+      (total-reports (var-get performance-reports-counter))
+      (avg-system-response (if (> total-reports u0) (/ (var-get total-response-time) total-reports) u0))
+    )
+    {
+      total-performance-reports: total-reports,
+      avg-system-response-time: avg-system-response,
+      total-emergencies: (var-get total-emergencies),
+      total-completed: (var-get total-completed),
+      system-efficiency: (if (> (var-get total-emergencies) u0) 
+        (/ (* (var-get total-completed) EFFICIENCY_MULTIPLIER) (var-get total-emergencies)) 
+        u0)
+    }
+  )
+)
+
+(define-read-only (get-ambulance-ranking)
+  (list)
+)
+
 ;; private functions
 (define-private (update-ambulance-completion (ambulance-id uint))
   (match (map-get? ambulances { ambulance-id: ambulance-id })
@@ -299,3 +496,92 @@
     false
   )
 )
+
+(define-private (update-ambulance-performance (ambulance-id uint) (response-time uint) (distance-traveled uint) (outcome-success bool))
+  (let
+    (
+      (current-performance (default-to 
+        { avg-response-time: u0, efficiency-score: u0, workload-points: u0, total-distance: u0, success-rate: u0, last-updated: u0 }
+        (map-get? ambulance-performance { ambulance-id: ambulance-id })
+      ))
+      (current-block stacks-block-height)
+      (new-avg-response (if (> (get avg-response-time current-performance) u0)
+        (/ (+ (get avg-response-time current-performance) response-time) u2)
+        response-time))
+      (new-total-distance (+ (get total-distance current-performance) distance-traveled))
+      (new-success-rate (if outcome-success 
+        (if (> (+ (get success-rate current-performance) u100000) u1000000) u1000000 (+ (get success-rate current-performance) u100000))
+        (if (< (get success-rate current-performance) u50000) u0 (- (get success-rate current-performance) u50000))))
+      (new-efficiency-score (calculate-efficiency-score new-avg-response new-success-rate (get workload-points current-performance)))
+    )
+    (map-set ambulance-performance
+      { ambulance-id: ambulance-id }
+      {
+        avg-response-time: new-avg-response,
+        efficiency-score: new-efficiency-score,
+        workload-points: (get workload-points current-performance),
+        total-distance: new-total-distance,
+        success-rate: new-success-rate,
+        last-updated: current-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-workload-points (ambulance-id uint) (calls-handled uint) (total-time-busy uint))
+  (let
+    (
+      (current-performance (default-to 
+        { avg-response-time: u0, efficiency-score: u0, workload-points: u0, total-distance: u0, success-rate: u0, last-updated: u0 }
+        (map-get? ambulance-performance { ambulance-id: ambulance-id })
+      ))
+      (workload-score (+ calls-handled (/ total-time-busy u100)))
+    )
+    (map-set ambulance-performance
+      { ambulance-id: ambulance-id }
+      (merge current-performance { workload-points: workload-score })
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-efficiency-score (avg-response-time uint) (success-rate uint) (workload-points uint))
+  (let
+    (
+      (response-factor (if (> avg-response-time u0) (/ PERFORMANCE_THRESHOLD avg-response-time) u0))
+      (success-factor success-rate)
+      (workload-factor (if (< workload-points MAX_WORKLOAD_POINTS) 
+        (- MAX_WORKLOAD_POINTS workload-points) 
+        u0))
+    )
+    (/ (+ (* response-factor u3) (* success-factor u2) workload-factor) u6)
+  )
+)
+
+(define-private (calculate-allocation-score (ambulance-id uint))
+  (let
+    (
+      (performance (default-to 
+        { avg-response-time: MAX_RESPONSE_TIME, efficiency-score: u0, workload-points: MAX_WORKLOAD_POINTS, total-distance: u0, success-rate: u0, last-updated: u0 }
+        (map-get? ambulance-performance { ambulance-id: ambulance-id })
+      ))
+      (ambulance (unwrap-panic (map-get? ambulances { ambulance-id: ambulance-id })))
+    )
+    (if (is-eq (get status ambulance) AMBULANCE_AVAILABLE)
+      (+ (get efficiency-score performance) (- MAX_WORKLOAD_POINTS (get workload-points performance)))
+      u0)
+  )
+)
+
+
+
+(define-private (get-improvement-actions (efficiency-score uint) (workload-points uint))
+  (if (< efficiency-score PERFORMANCE_THRESHOLD)
+    (if (> workload-points MAX_WORKLOAD_POINTS)
+      "reduce_workload_improve_response"
+      "improve_response_time")
+    (if (> workload-points MAX_WORKLOAD_POINTS)
+      "reduce_workload"
+      "maintain_performance")))
+
