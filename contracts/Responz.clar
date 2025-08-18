@@ -36,6 +36,28 @@
 (define-constant MAX_WORKLOAD_POINTS u100)
 (define-constant EFFICIENCY_MULTIPLIER u10000)
 
+(define-constant INCIDENT_CREATED u0)
+(define-constant INCIDENT_DISPATCHED u1)
+(define-constant INCIDENT_EN_ROUTE u2)
+(define-constant INCIDENT_ON_SCENE u3)
+(define-constant INCIDENT_TRANSPORTING u4)
+(define-constant INCIDENT_AT_HOSPITAL u5)
+(define-constant INCIDENT_COMPLETED u6)
+(define-constant INCIDENT_CANCELLED u7)
+
+(define-constant RESPONDER_AMBULANCE u0)
+(define-constant RESPONDER_FIRE u1)
+(define-constant RESPONDER_POLICE u2)
+(define-constant RESPONDER_HOSPITAL u3)
+
+(define-constant ERR_INCIDENT_NOT_FOUND (err u107))
+(define-constant ERR_INVALID_PHASE_TRANSITION (err u108))
+(define-constant ERR_RESPONDER_NOT_FOUND (err u109))
+(define-constant ERR_INSUFFICIENT_FUNDS (err u110))
+
+(define-constant BASE_SERVICE_COST u500000)
+(define-constant TRANSPORT_COST_PER_BLOCK u1000)
+
 ;; data vars
 (define-data-var emergency-counter uint u0)
 (define-data-var ambulance-counter uint u0)
@@ -43,6 +65,9 @@
 (define-data-var total-completed uint u0)
 (define-data-var total-response-time uint u0)
 (define-data-var performance-reports-counter uint u0)
+(define-data-var incident-counter uint u0)
+(define-data-var total-incidents uint u0)
+(define-data-var total-incident-cost uint u0)
 
 ;; data maps
 (define-map emergencies
@@ -118,6 +143,67 @@
     selected-ambulance: uint,
     allocation-score: uint,
     timestamp: uint
+  }
+)
+
+(define-map incidents
+  { incident-id: uint }
+  {
+    emergency-id: uint,
+    patient-id: (optional principal),
+    current-phase: uint,
+    priority-level: uint,
+    total-cost: uint,
+    created-at: uint,
+    completed-at: (optional uint),
+    created-by: principal
+  }
+)
+
+(define-map incident-phases
+  { incident-id: uint, phase: uint }
+  {
+    phase-name: uint,
+    started-at: uint,
+    completed-at: (optional uint),
+    responder-id: (optional uint),
+    responder-type: uint,
+    phase-cost: uint,
+    notes: (optional (string-ascii 100))
+  }
+)
+
+(define-map incident-responders
+  { incident-id: uint, responder-id: uint }
+  {
+    responder-type: uint,
+    assigned-at: uint,
+    role: (string-ascii 50),
+    active: bool,
+    performance-score: uint
+  }
+)
+
+(define-map incident-costs
+  { incident-id: uint }
+  {
+    base-service-cost: uint,
+    transport-cost: uint,
+    additional-costs: uint,
+    insurance-coverage: uint,
+    patient-payment: uint,
+    total-billed: uint
+  }
+)
+
+(define-map incident-handoffs
+  { incident-id: uint, handoff-id: uint }
+  {
+    from-responder: uint,
+    to-responder: uint,
+    handoff-time: uint,
+    patient-condition: (string-ascii 200),
+    verified: bool
   }
 )
 
@@ -410,6 +496,222 @@
   )
 )
 
+(define-public (create-incident (emergency-id uint) (patient-id (optional principal)) (priority-level uint))
+  (let
+    (
+      (incident-id (+ (var-get incident-counter) u1))
+      (current-block stacks-block-height)
+      (emergency (unwrap! (map-get? emergencies { emergency-id: emergency-id }) ERR_EMERGENCY_NOT_FOUND))
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (map-set incidents
+      { incident-id: incident-id }
+      {
+        emergency-id: emergency-id,
+        patient-id: patient-id,
+        current-phase: INCIDENT_CREATED,
+        priority-level: priority-level,
+        total-cost: u0,
+        created-at: current-block,
+        completed-at: none,
+        created-by: tx-sender
+      }
+    )
+    
+    (map-set incident-phases
+      { incident-id: incident-id, phase: INCIDENT_CREATED }
+      {
+        phase-name: INCIDENT_CREATED,
+        started-at: current-block,
+        completed-at: none,
+        responder-id: none,
+        responder-type: RESPONDER_AMBULANCE,
+        phase-cost: u0,
+        notes: none
+      }
+    )
+    
+    (map-set incident-costs
+      { incident-id: incident-id }
+      {
+        base-service-cost: BASE_SERVICE_COST,
+        transport-cost: u0,
+        additional-costs: u0,
+        insurance-coverage: u0,
+        patient-payment: u0,
+        total-billed: u0
+      }
+    )
+    
+    (var-set incident-counter incident-id)
+    (var-set total-incidents (+ (var-get total-incidents) u1))
+    
+    (ok incident-id)
+  )
+)
+
+(define-public (advance-incident-phase (incident-id uint) (new-phase uint) (responder-id (optional uint)) (responder-type uint))
+  (let
+    (
+      (incident (unwrap! (map-get? incidents { incident-id: incident-id }) ERR_INCIDENT_NOT_FOUND))
+      (current-block stacks-block-height)
+      (current-phase (get current-phase incident))
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (asserts! (is-valid-phase-transition current-phase new-phase) ERR_INVALID_PHASE_TRANSITION)
+    
+    (map-set incident-phases
+      { incident-id: incident-id, phase: current-phase }
+      (merge (unwrap-panic (map-get? incident-phases { incident-id: incident-id, phase: current-phase }))
+        { completed-at: (some current-block) }
+      )
+    )
+    
+    (map-set incident-phases
+      { incident-id: incident-id, phase: new-phase }
+      {
+        phase-name: new-phase,
+        started-at: current-block,
+        completed-at: none,
+        responder-id: responder-id,
+        responder-type: responder-type,
+        phase-cost: (calculate-phase-cost new-phase),
+        notes: none
+      }
+    )
+    
+    (map-set incidents
+      { incident-id: incident-id }
+      (merge incident { 
+        current-phase: new-phase,
+        total-cost: (+ (get total-cost incident) (calculate-phase-cost new-phase))
+      })
+    )
+    
+    (if (is-eq new-phase INCIDENT_COMPLETED)
+      (map-set incidents
+        { incident-id: incident-id }
+        (merge incident { completed-at: (some current-block) })
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (assign-responder (incident-id uint) (responder-id uint) (responder-type uint) (role (string-ascii 50)))
+  (let
+    (
+      (incident (unwrap! (map-get? incidents { incident-id: incident-id }) ERR_INCIDENT_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (map-set incident-responders
+      { incident-id: incident-id, responder-id: responder-id }
+      {
+        responder-type: responder-type,
+        assigned-at: current-block,
+        role: role,
+        active: true,
+        performance-score: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-handoff (incident-id uint) (handoff-id uint) (from-responder uint) (to-responder uint) (patient-condition (string-ascii 200)))
+  (let
+    (
+      (incident (unwrap! (map-get? incidents { incident-id: incident-id }) ERR_INCIDENT_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (map-set incident-handoffs
+      { incident-id: incident-id, handoff-id: handoff-id }
+      {
+        from-responder: from-responder,
+        to-responder: to-responder,
+        handoff-time: current-block,
+        patient-condition: patient-condition,
+        verified: false
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (verify-handoff (incident-id uint) (handoff-id uint))
+  (let
+    (
+      (handoff (unwrap! (map-get? incident-handoffs { incident-id: incident-id, handoff-id: handoff-id }) ERR_INCIDENT_NOT_FOUND))
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (map-set incident-handoffs
+      { incident-id: incident-id, handoff-id: handoff-id }
+      (merge handoff { verified: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-incident-billing (incident-id uint) (insurance-coverage uint) (patient-payment uint))
+  (let
+    (
+      (incident (unwrap! (map-get? incidents { incident-id: incident-id }) ERR_INCIDENT_NOT_FOUND))
+      (costs (unwrap! (map-get? incident-costs { incident-id: incident-id }) ERR_INCIDENT_NOT_FOUND))
+    )
+    (asserts! (or 
+      (is-eq tx-sender CONTRACT_OWNER)
+      (default-to false (map-get? authorized-dispatchers tx-sender))
+    ) ERR_UNAUTHORIZED)
+    
+    (asserts! (is-eq (get current-phase incident) INCIDENT_COMPLETED) ERR_INVALID_PHASE_TRANSITION)
+    
+    (let
+      (
+        (total-billed (+ (get base-service-cost costs) (get transport-cost costs) (get additional-costs costs)))
+      )
+      (map-set incident-costs
+        { incident-id: incident-id }
+        (merge costs {
+          insurance-coverage: insurance-coverage,
+          patient-payment: patient-payment,
+          total-billed: total-billed
+        })
+      )
+      
+      (var-set total-incident-cost (+ (var-get total-incident-cost) total-billed))
+      
+      (ok total-billed)
+    )
+  )
+)
+
 ;; read only functions
 (define-read-only (get-emergency (emergency-id uint))
   (map-get? emergencies { emergency-id: emergency-id })
@@ -480,6 +782,41 @@
 
 (define-read-only (get-ambulance-ranking)
   (list)
+)
+
+(define-read-only (get-incident (incident-id uint))
+  (map-get? incidents { incident-id: incident-id })
+)
+
+(define-read-only (get-incident-phase (incident-id uint) (phase uint))
+  (map-get? incident-phases { incident-id: incident-id, phase: phase })
+)
+
+(define-read-only (get-incident-responder (incident-id uint) (responder-id uint))
+  (map-get? incident-responders { incident-id: incident-id, responder-id: responder-id })
+)
+
+(define-read-only (get-incident-costs (incident-id uint))
+  (map-get? incident-costs { incident-id: incident-id })
+)
+
+(define-read-only (get-incident-handoff (incident-id uint) (handoff-id uint))
+  (map-get? incident-handoffs { incident-id: incident-id, handoff-id: handoff-id })
+)
+
+(define-read-only (get-incident-statistics)
+  {
+    total-incidents: (var-get total-incidents),
+    active-incidents: (var-get incident-counter),
+    total-incident-cost: (var-get total-incident-cost),
+    avg-incident-cost: (if (> (var-get total-incidents) u0) 
+      (/ (var-get total-incident-cost) (var-get total-incidents)) 
+      u0)
+  }
+)
+
+(define-read-only (get-incident-count)
+  (var-get incident-counter)
 )
 
 ;; private functions
@@ -584,4 +921,32 @@
     (if (> workload-points MAX_WORKLOAD_POINTS)
       "reduce_workload"
       "maintain_performance")))
+
+(define-private (is-valid-phase-transition (current-phase uint) (new-phase uint))
+  (or
+    (and (is-eq current-phase INCIDENT_CREATED) 
+         (or (is-eq new-phase INCIDENT_DISPATCHED) (is-eq new-phase INCIDENT_CANCELLED)))
+    (and (is-eq current-phase INCIDENT_DISPATCHED) 
+         (or (is-eq new-phase INCIDENT_EN_ROUTE) (is-eq new-phase INCIDENT_CANCELLED)))
+    (and (is-eq current-phase INCIDENT_EN_ROUTE) 
+         (or (is-eq new-phase INCIDENT_ON_SCENE) (is-eq new-phase INCIDENT_CANCELLED)))
+    (and (is-eq current-phase INCIDENT_ON_SCENE) 
+         (or (is-eq new-phase INCIDENT_TRANSPORTING) (is-eq new-phase INCIDENT_COMPLETED) (is-eq new-phase INCIDENT_CANCELLED)))
+    (and (is-eq current-phase INCIDENT_TRANSPORTING) 
+         (or (is-eq new-phase INCIDENT_AT_HOSPITAL) (is-eq new-phase INCIDENT_CANCELLED)))
+    (and (is-eq current-phase INCIDENT_AT_HOSPITAL) 
+         (or (is-eq new-phase INCIDENT_COMPLETED) (is-eq new-phase INCIDENT_CANCELLED)))
+  )
+)
+
+(define-private (calculate-phase-cost (phase uint))
+  (if (is-eq phase INCIDENT_TRANSPORTING)
+    TRANSPORT_COST_PER_BLOCK
+    (if (is-eq phase INCIDENT_AT_HOSPITAL)
+      (* BASE_SERVICE_COST u2)
+      (if (is-eq phase INCIDENT_ON_SCENE)
+        BASE_SERVICE_COST
+        u0))))
+
+
 
